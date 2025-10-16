@@ -25,6 +25,27 @@ type Interface interface {
 	Delete(ctx context.Context, name string) error
 }
 
+// NotificationEvent represents an event from bucket notifications
+type NotificationEvent struct {
+	EventName string // e.g., "s3:ObjectCreated:*", "s3:ObjectRemoved:*"
+	Bucket    string
+	Key       string
+	Size      int64
+	ETag      string
+}
+
+// NotificationListener is called when a notification event is received
+type NotificationListener func(event NotificationEvent)
+
+// NotificationInterface is an optional interface that backends can implement
+// to support real-time notifications instead of polling.
+type NotificationInterface interface {
+	// StartNotifications starts listening for bucket notifications and calls
+	// the listener function for each event. This should run in a goroutine.
+	// Returns a channel that can be used to stop listening.
+	StartNotifications(ctx context.Context, prefix string, listener NotificationListener) (<-chan struct{}, error)
+}
+
 // InitFunc is the type for the backend constructor function used to register
 // backend.
 type InitFunc func(ctx context.Context, p InitParams) (Interface, error)

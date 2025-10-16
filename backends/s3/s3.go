@@ -3,6 +3,7 @@ package s3
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -17,6 +18,9 @@ import (
 	"time"
 
 	"github.com/PowerDNS/go-tlsconfig"
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/sqs"
 	"github.com/go-logr/logr"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
@@ -44,6 +48,10 @@ const (
 	DefaultSecretsRefreshInterval = 15 * time.Second
 	// DefaultDisableContentMd5 : disable sending the Content-MD5 header
 	DefaultDisableContentMd5 = false
+	// DefaultNotificationWaitTimeSeconds is the default wait time for SQS messages
+	DefaultNotificationWaitTimeSeconds = 20
+	// DefaultNotificationVisibilityTimeoutSeconds is the default visibility timeout for SQS messages
+	DefaultNotificationVisibilityTimeoutSeconds = 30
 )
 
 // Options describes the storage options for the S3 backend
@@ -161,6 +169,23 @@ type Options struct {
 	// some reason get out of sync.
 	UpdateMarkerForceListInterval time.Duration `yaml:"update_marker_force_list_interval"`
 
+	// EnableNotifications enables S3 bucket event notifications.
+	// When enabled, the backend will listen for S3 events instead of polling.
+	// Requires SQS queue and appropriate bucket notification configuration.
+	EnableNotifications bool `yaml:"enable_notifications"`
+
+	// NotificationQueueURL is the SQS queue URL to receive bucket notifications.
+	// Required when EnableNotifications is true.
+	NotificationQueueURL string `yaml:"notification_queue_url"`
+
+	// NotificationWaitTimeSeconds is the maximum time to wait for messages in SQS.
+	// Default is 20 seconds. Maximum is 20 seconds.
+	NotificationWaitTimeSeconds int `yaml:"notification_wait_time_seconds"`
+
+	// NotificationVisibilityTimeoutSeconds is the visibility timeout for SQS messages.
+	// Default is 30 seconds.
+	NotificationVisibilityTimeoutSeconds int `yaml:"notification_visibility_timeout_seconds"`
+
 	// Not loaded from YAML
 	Logger logr.Logger `yaml:"-"`
 }
@@ -176,6 +201,17 @@ func (o Options) Check() error {
 	}
 	if o.Bucket == "" {
 		return fmt.Errorf("s3 storage.options: bucket is required")
+	}
+	if o.EnableNotifications {
+		if o.NotificationQueueURL == "" {
+			return fmt.Errorf("s3 storage.options: notification_queue_url is required when enable_notifications is true")
+		}
+		if o.NotificationWaitTimeSeconds < 0 || o.NotificationWaitTimeSeconds > 20 {
+			return fmt.Errorf("s3 storage.options: notification_wait_time_seconds must be between 0 and 20")
+		}
+		if o.NotificationVisibilityTimeoutSeconds < 0 {
+			return fmt.Errorf("s3 storage.options: notification_visibility_timeout_seconds must be non-negative")
+		}
 	}
 	return nil
 }
@@ -404,6 +440,12 @@ func New(ctx context.Context, opt Options) (*Backend, error) {
 	if opt.SecretsRefreshInterval == 0 {
 		opt.SecretsRefreshInterval = DefaultSecretsRefreshInterval
 	}
+	if opt.NotificationWaitTimeSeconds == 0 {
+		opt.NotificationWaitTimeSeconds = 20
+	}
+	if opt.NotificationVisibilityTimeoutSeconds == 0 {
+		opt.NotificationVisibilityTimeoutSeconds = 30
+	}
 	if err := opt.Check(); err != nil {
 		return nil, err
 	}
@@ -567,6 +609,150 @@ func getOpt[T comparable](optVal, defaultVal T) T {
 // passed as input
 func (b *Backend) prependGlobalPrefix(name string) string {
 	return b.opt.GlobalPrefix + name
+}
+
+// StartNotifications implements the NotificationInterface for S3 bucket event notifications
+func (b *Backend) StartNotifications(ctx context.Context, prefix string, listener simpleblob.NotificationListener) (<-chan struct{}, error) {
+	if !b.opt.EnableNotifications {
+		return nil, fmt.Errorf("notifications are not enabled for this backend")
+	}
+
+	stopCh := make(chan struct{})
+
+	go func() {
+		defer close(stopCh)
+
+		// Create AWS session for SQS
+		// Use the same region as configured for S3
+		// Credentials will be resolved using AWS default credential chain
+		// (environment variables, IAM roles, etc.)
+		sess, err := session.NewSession(&aws.Config{
+			Region: aws.String(b.opt.Region),
+		})
+		if err != nil {
+			b.log.Error(err, "Failed to create AWS session for SQS")
+			return
+		}
+
+		sqsClient := sqs.New(sess)
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
+			// Receive messages from SQS
+			receiveInput := &sqs.ReceiveMessageInput{
+				QueueUrl:            aws.String(b.opt.NotificationQueueURL),
+				MaxNumberOfMessages: aws.Int64(10),
+				WaitTimeSeconds:     aws.Int64(int64(b.opt.NotificationWaitTimeSeconds)),
+				VisibilityTimeout:   aws.Int64(int64(b.opt.NotificationVisibilityTimeoutSeconds)),
+			}
+
+			result, err := sqsClient.ReceiveMessageWithContext(ctx, receiveInput)
+			if err != nil {
+				b.log.Error(err, "Failed to receive SQS messages")
+				// Sleep a bit before retrying
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(time.Second):
+				}
+				continue
+			}
+
+			// Process messages
+			for _, message := range result.Messages {
+				if message.Body == nil {
+					continue
+				}
+
+				// Parse S3 event notification
+				event, err := b.parseS3Notification(*message.Body)
+				if err != nil {
+					b.log.Error(err, "Failed to parse S3 notification", "body", *message.Body)
+					continue
+				}
+
+				// Filter by prefix if specified
+				if prefix != "" && !strings.HasPrefix(event.Key, prefix) {
+					continue
+				}
+
+				// Call the listener
+				listener(event)
+
+				// Delete the message from the queue
+				_, err = sqsClient.DeleteMessageWithContext(ctx, &sqs.DeleteMessageInput{
+					QueueUrl:      aws.String(b.opt.NotificationQueueURL),
+					ReceiptHandle: message.ReceiptHandle,
+				})
+				if err != nil {
+					b.log.Error(err, "Failed to delete SQS message", "receiptHandle", *message.ReceiptHandle)
+				}
+			}
+		}
+	}()
+
+	return stopCh, nil
+}
+
+// S3EventRecord represents a single S3 event record in the notification
+type S3EventRecord struct {
+	EventVersion string `json:"eventVersion"`
+	EventSource  string `json:"eventSource"`
+	AWSRegion    string `json:"awsRegion"`
+	EventTime    string `json:"eventTime"`
+	EventName    string `json:"eventName"`
+	S3           struct {
+		Bucket struct {
+			Name string `json:"name"`
+		} `json:"bucket"`
+		Object struct {
+			Key       string `json:"key"`
+			Size      int64  `json:"size,omitempty"`
+			ETag      string `json:"eTag,omitempty"`
+			VersionID string `json:"versionId,omitempty"`
+		} `json:"object"`
+	} `json:"s3"`
+}
+
+// S3EventNotification represents the complete S3 event notification
+type S3EventNotification struct {
+	Records []S3EventRecord `json:"Records"`
+}
+
+// parseS3Notification parses an S3 event notification from SQS message body
+func (b *Backend) parseS3Notification(messageBody string) (simpleblob.NotificationEvent, error) {
+	var notification S3EventNotification
+	if err := json.Unmarshal([]byte(messageBody), &notification); err != nil {
+		return simpleblob.NotificationEvent{}, fmt.Errorf("failed to parse S3 notification JSON: %w", err)
+	}
+
+	if len(notification.Records) == 0 {
+		return simpleblob.NotificationEvent{}, fmt.Errorf("no records in S3 notification")
+	}
+
+	// Use the first record (there should typically be only one)
+	record := notification.Records[0]
+
+	// URL decode the key
+	key, err := url.QueryUnescape(record.S3.Object.Key)
+	if err != nil {
+		return simpleblob.NotificationEvent{}, fmt.Errorf("failed to unescape S3 object key: %w", err)
+	}
+
+	event := simpleblob.NotificationEvent{
+		EventName: record.EventName,
+		Bucket:    record.S3.Bucket.Name,
+		Key:       key,
+		Size:      record.S3.Object.Size,
+		ETag:      record.S3.Object.ETag,
+	}
+
+	return event, nil
 }
 
 func init() {
